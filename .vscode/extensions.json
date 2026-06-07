@@ -1,0 +1,26 @@
+{
+	// See https://go.microsoft.com/fwlink/?LinkId=827846 to learn about workspace recommendations.
+	// Extension identifier format: ${publisher}.${name}. Example: vscode.csharp
+	// List of extensions which should be recommended for users of this workspace.
+	"recommendations": [
+		"github.copilot-chat",
+		"gruntfuggly.todo-tree",
+		"anthropic.claude-code",
+		"google.geminicodeassist",
+		"kilocode.kilo-code",
+		"google.gemini-cli-vscode-ide-companion",
+		"openai.chatgpt",
+		"saoudrizwan.claude-dev",
+		"continue.continue",
+		"mermaidchart.vscode-mermaid-chart",
+		"prisma.prisma",
+		"ms-vscode.vscode-typescript-next",
+		"ms-vscode-remote.remote-ssh",
+		"bradlc.vscode-tailwindcss",
+		"ms-azuretools.vscode-docker",
+		"rust-lang.rust-analyzer", 
+		"redhat.vscode-xml"
+	],
+	// List of extensions recommended by VS Code that should not be recommended for users of this workspace.
+	"unwantedRecommendations": []
+}
