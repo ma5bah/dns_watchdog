@@ -60,7 +60,7 @@ DEFAULT_CONFIG = {
     # Domains or substrings to watch — any hit whose queried domain
     # contains one of these strings (case-insensitive) triggers an alert.
     "watchlist": [
-        "facebook.com",
+        "not-random-facebook.com",
     ],
     # Optional path to a plain text file containing one domain/substring per line.
     # Empty string means no file is used.
