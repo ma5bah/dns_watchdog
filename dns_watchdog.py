@@ -57,20 +57,19 @@ def update_paths(config_file: str = None, log_file: str = None):
         LOG_PATH = expand_user_path(log_file).resolve()
 
 DEFAULT_CONFIG = {
-    # Domains or substrings to watch — any hit whose queried domain
-    # contains one of these strings (case-insensitive) triggers an alert.
-    "watchlist": [
-        "not-random-facebook.com",
+    # Profiles allow you to map different domain lists to different notification sounds.
+    "profiles": [
+        {
+            "name": "Default Profile",
+            "watchlist": [
+                "not-random-facebook.com",
+            ],
+            "watchlist_file": "~/project/clarity/root_custom_blocklist.txt",
+            "alert_sound": "~/project/clarity/qayamat.wav",
+        }
     ],
-    # Optional path to a plain text file containing one domain/substring per line.
-    # Empty string means no file is used.
-    "watchlist_file": "~/project/clarity/root_custom_blocklist.txt",
     # Seconds to suppress repeated alerts for the same domain.
     "cooldown_seconds": 60,
-    # macOS notification sound. Common values: "Basso", "Blow", "Bottle",
-    # "Frog", "Glass", "Hero", "Morse", "Ping", "Pop", "Purr",
-    # "Sosumi", "Submarine", "Tink". Leave empty to show notification without sound.
-    "alert_sound": "~/project/clarity/qayamat.wav",
     # How verbose the log file should be: DEBUG | INFO | WARNING
     "log_level": "INFO",
     # If true, also print parsed DNS events that do NOT match the watchlist.
@@ -113,28 +112,52 @@ def load_config() -> dict:
         try:
             with open(CONFIG_PATH) as f:
                 user_cfg = json.load(f)
+            
+            # Migrate legacy flat config to profiles if present
+            if "watchlist" in user_cfg or "watchlist_file" in user_cfg:
+                profile = {
+                    "name": "Legacy Profile",
+                    "watchlist": user_cfg.get("watchlist", []),
+                    "watchlist_file": user_cfg.get("watchlist_file", ""),
+                    "alert_sound": user_cfg.get("alert_sound", ""),
+                    "alert_sound_duration": user_cfg.get("alert_sound_duration", 0)
+                }
+                user_cfg["profiles"] = [profile]
+                user_cfg.pop("watchlist", None)
+                user_cfg.pop("watchlist_file", None)
+                user_cfg.pop("alert_sound", None)
+                user_cfg.pop("alert_sound_duration", None)
+                
             # Merge with defaults so new keys are always present.
             merged.update(user_cfg)
         except (json.JSONDecodeError, OSError) as e:
             print(f"[WARN] Could not read config ({e}); using defaults.", file=sys.stderr)
             
-    # Load from external text file if configured
-    wl_path_str = merged.get("watchlist_file")
-    if wl_path_str:
-        wl_path = expand_user_path(wl_path_str)
-        if wl_path.exists():
-            try:
-                with open(wl_path) as f:
-                    for line in f:
-                        line = line.strip()
-                        # Ignore empty lines and comments
-                        if line and not line.startswith("#"):
-                            merged["watchlist"].append(line)
-            except OSError as e:
-                print(f"[WARN] Could not read watchlist file ({e}).", file=sys.stderr)
-                
-    # Remove any duplicate entries
-    merged["watchlist"] = list(set(merged["watchlist"]))
+    if "profiles" not in merged:
+        merged["profiles"] = []
+
+    # Process each profile
+    for profile in merged["profiles"]:
+        if "watchlist" not in profile:
+            profile["watchlist"] = []
+            
+        wl_path_str = profile.get("watchlist_file")
+        if wl_path_str:
+            wl_path = expand_user_path(wl_path_str)
+            if wl_path.exists():
+                try:
+                    with open(wl_path) as f:
+                        for line in f:
+                            line = line.strip()
+                            # Ignore empty lines and comments
+                            if line and not line.startswith("#"):
+                                profile["watchlist"].append(line)
+                except OSError as e:
+                    print(f"[WARN] Could not read watchlist file for profile '{profile.get('name')}' ({e}).", file=sys.stderr)
+                    
+        # Remove any duplicate entries
+        profile["watchlist"] = list(set(profile["watchlist"]))
+        
     return merged
 
 
@@ -285,21 +308,22 @@ def parse_domain(line: str) -> str | None:
 #  Watchlist matcher
 # ─────────────────────────────────────────────
 
-def match_watchlist(domain: str, watchlist: list[str]) -> str | None:
+def match_profiles(domain: str, profiles: list[dict]) -> tuple[str, dict] | None:
     """
-    Return the first matching watchlist entry.
+    Return the (matched_rule, profile) for the given domain.
     If the rule ends with a dot (e.g. 'tracking.'), it does a substring match.
     Otherwise, it matches the exact domain or its subdomains (e.g. 'b.com' matches 'a.b.com' but not 'bob.com').
     """
     dl = domain.lower()
-    for entry in watchlist:
-        el = entry.lower()
-        if el.endswith("."):
-            if el in dl:
-                return entry
-        else:
-            if dl == el or dl.endswith("." + el):
-                return entry
+    for profile in profiles:
+        for entry in profile.get("watchlist", []):
+            el = entry.lower()
+            if el.endswith("."):
+                if el in dl:
+                    return entry, profile
+            else:
+                if dl == el or dl.endswith("." + el):
+                    return entry, profile
     return None
 
 
@@ -341,10 +365,9 @@ class DnsWatchdog:
         signal.signal(signal.SIGINT,  self._handle_signal)
         signal.signal(signal.SIGTERM, self._handle_signal)
 
-        self.logger.info("DNS Watchdog starting — watchlist has "
-                         f"{len(self.cfg['watchlist'])} entries, "
+        total_rules = sum(len(p.get("watchlist", [])) for p in self.cfg.get("profiles", []))
+        self.logger.info(f"DNS Watchdog starting — {len(self.cfg.get('profiles', []))} profiles with {total_rules} rules total, "
                          f"cooldown={self.cfg['cooldown_seconds']}s")
-        # self.logger.info(f"Watchlist entries: {self.cfg['watchlist']}")
 
         while not self._stop.is_set():
             try:
@@ -392,29 +415,30 @@ class DnsWatchdog:
         if domain is None:
             return
 
-        hit = match_watchlist(domain, self.cfg["watchlist"])
+        hit_info = match_profiles(domain, self.cfg.get("profiles", []))
 
-        if hit:
+        if hit_info:
+            hit, profile = hit_info
             self._stats[domain] += 1
             self.logger.info(f"{line}")
-            self.logger.info(f"[HIT] {domain}  (matched: '{hit}', "
+            self.logger.info(f"[HIT] {domain}  (matched: '{hit}', profile: '{profile.get('name', 'unnamed')}', "
                              f"total_hits={self._stats[domain]})")
             if self.limiter.should_alert(hit):
-                self._fire_alert(domain, hit)
+                self._fire_alert(domain, hit, profile)
             else:
                 self.logger.debug(f"[RATE-LIMITED] {domain} (rule: '{hit}')")
         elif self.cfg.get("verbose_non_hits"):
             self.logger.debug(f"[DNS] {domain}")
 
-    def _fire_alert(self, domain: str, matched_rule: str):
+    def _fire_alert(self, domain: str, matched_rule: str, profile: dict):
         ts = datetime.now().strftime("%H:%M:%S")
-        self.logger.warning(f"[ALERT] {domain}  rule='{matched_rule}'  time={ts}")
+        self.logger.warning(f"[ALERT] {domain}  rule='{matched_rule}'  profile='{profile.get('name', 'unnamed')}'  time={ts}")
         notify(
-            title          = "⚠️ DNS Watchdog Hit",
+            title          = f"⚠️ DNS Watchdog: {profile.get('name', 'Hit')}",
             subtitle       = f"Rule: {matched_rule}",
             body           = f"{domain}  [{ts}]",
-            sound          = self.cfg["alert_sound"],
-            sound_duration = self.cfg.get("alert_sound_duration", 0),
+            sound          = profile.get("alert_sound", ""),
+            sound_duration = profile.get("alert_sound_duration", 0),
             logger         = self.logger,
         )
 
@@ -442,9 +466,12 @@ COMMANDS
 
 CONFIGURATION
   Edit  ~/.dns_watchdog/config.json  to customise:
-    watchlist          — list of domain substrings to watch
+    profiles           — list of profiles, each containing:
+                           name: name of the profile
+                           watchlist: list of domain substrings to watch
+                           watchlist_file: external text file containing domains
+                           alert_sound: macOS system sound name or path to audio file
     cooldown_seconds   — alert suppression window per domain
-    alert_sound        — macOS system sound name (empty string = silent)
     log_level          — DEBUG | INFO | WARNING
     verbose_non_hits   — log every DNS query, not just hits
 
@@ -461,12 +488,19 @@ REQUIREMENTS
 
 def cmd_test(cfg: dict, logger: logging.Logger):
     logger.info("[TEST] Firing test notification …")
+    
+    sound = ""
+    duration = 0
+    if cfg.get("profiles"):
+        sound = cfg["profiles"][0].get("alert_sound", "")
+        duration = cfg["profiles"][0].get("alert_sound_duration", 0)
+        
     notify(
         title          = "✅ DNS Watchdog — Test",
         subtitle       = "Notifications are working",
         body           = "If you see this, alerts are configured correctly.",
-        sound          = cfg["alert_sound"],
-        sound_duration = cfg.get("alert_sound_duration", 0),
+        sound          = sound,
+        sound_duration = duration,
         logger         = logger,
     )
     logger.info("[TEST] Done.")
@@ -584,7 +618,11 @@ def main():
     if args.verbose:
         cfg["log_level"] = "DEBUG"
     if args.watchlist_file:
-        cfg["watchlist_file"] = args.watchlist_file
+        if not cfg.get("profiles"):
+            cfg["profiles"] = [{"name": "CLI Override", "watchlist": [], "watchlist_file": args.watchlist_file, "alert_sound": ""}]
+        else:
+            cfg["profiles"][0]["watchlist_file"] = args.watchlist_file
+            
         # Reload watchlist if file was overridden
         wl_path = expand_user_path(args.watchlist_file)
         if wl_path.exists():
@@ -593,8 +631,8 @@ def main():
                     for line in f:
                         line = line.strip()
                         if line and not line.startswith("#"):
-                            cfg["watchlist"].append(line)
-                cfg["watchlist"] = list(set(cfg["watchlist"]))
+                            cfg["profiles"][0]["watchlist"].append(line)
+                cfg["profiles"][0]["watchlist"] = list(set(cfg["profiles"][0]["watchlist"]))
             except OSError as e:
                 print(f"[WARN] Could not read CLI watchlist file ({e}).", file=sys.stderr)
 
