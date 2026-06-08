@@ -64,8 +64,8 @@ DEFAULT_CONFIG = {
             "watchlist": [
                 "not-random-facebook.com",
             ],
-            "watchlist_file": "~/project/clarity/root_custom_blocklist.txt",
-            "alert_sound": "~/project/clarity/qayamat.wav",
+            "watchlist_file": "~/project/clarity/Note/System_Configs/Blocklist/root_custom_blocklist.txt",
+            "alert_sound": "~/project/clarity/Note/Religion/Audio/qayamat.wav",
         }
     ],
     # Seconds to suppress repeated alerts for the same domain.

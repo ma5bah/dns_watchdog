@@ -4,15 +4,19 @@ mod rate_limit;
 mod watchdog;
 
 use clap::{Parser, Subcommand};
-use log::{error, info, LevelFilter};
+use log::{LevelFilter, error, info};
 use std::env;
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use config::{expand_user_path, get_true_home, load_config, save_default_config};
+use config::{
+    Config, apply_watchlist_override, expand_user_path, get_true_home, load_config,
+    save_default_config,
+};
 use notify::notify;
 use watchdog::DnsWatchdog;
 
@@ -23,16 +27,16 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     config: Option<String>,
 
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     log: Option<String>,
 
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     watchlist_file: Option<String>,
 
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     verbose: bool,
 }
 
@@ -55,14 +59,21 @@ fn setup_logging(level_str: &str, log_path: &Path) {
         _ => LevelFilter::Info,
     };
 
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent).expect("Failed to create log directory");
+    }
+
     let file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(log_path)
         .expect("Failed to open log file");
 
-    let target = env_logger::Target::Pipe(Box::new(file));
-    
+    let target = env_logger::Target::Pipe(Box::new(TeeWriter {
+        file,
+        stdout: io::stdout(),
+    }));
+
     env_logger::Builder::new()
         .filter_level(level)
         .format_timestamp_secs()
@@ -70,18 +81,40 @@ fn setup_logging(level_str: &str, log_path: &Path) {
         .init();
 }
 
+struct TeeWriter {
+    file: fs::File,
+    stdout: io::Stdout,
+}
+
+impl Write for TeeWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.file.write_all(buf)?;
+        self.stdout.write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()?;
+        self.stdout.flush()
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
-    
+
     let default_config_path = {
         let mut p = get_true_home();
         p.push(".dns_watchdog");
         p.push("config.json");
         p
     };
-    
-    let config_path = cli.config.as_ref().map(|c| expand_user_path(c)).unwrap_or(default_config_path);
-    
+
+    let config_path = cli
+        .config
+        .as_ref()
+        .map(|c| expand_user_path(c))
+        .unwrap_or(default_config_path);
+
     let log_path = if let Some(l) = cli.log.as_ref() {
         expand_user_path(l)
     } else {
@@ -91,30 +124,17 @@ fn main() {
     };
 
     save_default_config(&config_path);
-    
+
     let mut cfg = load_config(&config_path);
     if cli.verbose {
         cfg.log_level = "DEBUG".to_string();
     }
     if let Some(w) = cli.watchlist_file.as_ref() {
-        cfg.watchlist_file = w.clone();
-        let wl_path = expand_user_path(w);
-        if wl_path.exists() {
-            if let Ok(contents) = fs::read_to_string(&wl_path) {
-                for line in contents.lines() {
-                    let trimmed = line.trim();
-                    if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                        cfg.watchlist.push(trimmed.to_string());
-                    }
-                }
-            }
-        }
-        cfg.watchlist.sort();
-        cfg.watchlist.dedup();
+        apply_watchlist_override(&mut cfg, w);
     }
-    
+
     let cmd = cli.command.unwrap_or(Commands::Run);
-    
+
     if cmd == Commands::Config {
         use std::io::Write;
         let mut stdout = std::io::stdout().lock();
@@ -125,27 +145,37 @@ fn main() {
     }
     if cmd == Commands::Init {
         println!("Config is at {}", config_path.display());
+        if let Some(parent) = config_path.parent() {
+            fs::create_dir_all(parent).expect("Failed to create config directory");
+        }
+        let json =
+            serde_json::to_string_pretty(&Config::default()).expect("Failed to serialize config");
+        fs::write(&config_path, json).expect("Failed to write default config");
+        println!("Default config written.");
         return;
     }
-    
+
     setup_logging(&cfg.log_level, &log_path);
 
     match cmd {
         Commands::Test => {
             info!("[TEST] Firing test notification …");
+            let (sound, duration) = cfg
+                .profiles
+                .first()
+                .map(|profile| (profile.alert_sound.as_str(), profile.alert_sound_duration))
+                .unwrap_or(("", 0));
             notify(
                 "✅ DNS Watchdog — Test",
                 "Notifications are working",
                 "If you see this, alerts are configured correctly.",
-                Some(&cfg.alert_sound),
+                sound,
+                duration,
             );
             info!("[TEST] Done.");
         }
         Commands::Stop => {
-            info!("[STOP] Stopping running instances of dns-watchdog and audio ...");
-            let _ = Command::new("killall").arg("dns-watchdog").status();
-            let _ = Command::new("killall").arg("afplay").status();
-            info!("[STOP] Done.");
+            cmd_stop();
         }
         Commands::Install => {
             cmd_install(&config_path);
@@ -159,13 +189,14 @@ fn main() {
                 error!("FATAL: You must run this script with sudo to sniff network packets!");
                 process::exit(1);
             }
-            
+
             let stop_flag = Arc::new(AtomicBool::new(false));
             let r = stop_flag.clone();
 
             ctrlc::set_handler(move || {
                 r.store(true, Ordering::SeqCst);
-            }).expect("Error setting Ctrl-C handler");
+            })
+            .expect("Error setting Ctrl-C handler");
 
             let mut watchdog = DnsWatchdog::new(cfg, stop_flag);
             watchdog.run();
@@ -179,17 +210,19 @@ fn cmd_install(config_path: &Path) {
         eprintln!("FATAL: You must run 'install' with sudo.");
         process::exit(1);
     }
-    
+
     let active_user = notify::get_active_user();
     if active_user == "root" {
-        eprintln!("Could not detect SUDO_USER. Run this using 'sudo ./target/release/dns-watchdog install'");
+        eprintln!(
+            "Could not detect SUDO_USER. Run this using 'sudo ./target/release/dns-watchdog install'"
+        );
         process::exit(1);
     }
-    
+
     let home_dir = get_true_home();
     let exec_path = env::current_exe().expect("Failed to get current executable path");
     let plist_path = PathBuf::from("/Library/LaunchDaemons/com.user.dns-watchdog.plist");
-    
+
     let plist_content = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -224,19 +257,19 @@ fn cmd_install(config_path: &Path) {
     );
 
     fs::write(&plist_path, plist_content).expect("Failed to write plist file");
-    
+
     let _ = Command::new("launchctl")
         .args(["unload", &plist_path.to_string_lossy()])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-        
+
     let status = Command::new("launchctl")
         .args(["load", "-w", &plist_path.to_string_lossy()])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-    
+
     if status.is_ok() && status.unwrap().success() {
         println!("✅ DNS Watchdog installed and started as a background daemon!");
     } else {
@@ -244,12 +277,37 @@ fn cmd_install(config_path: &Path) {
     }
 }
 
+fn cmd_stop() {
+    info!("[STOP] Stopping running instances of dns-watchdog and audio ...");
+    let my_pid = process::id().to_string();
+
+    match Command::new("pgrep").args(["-f", "dns-watchdog"]).output() {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            for pid in stdout.lines().map(str::trim) {
+                if !pid.is_empty() && pid != my_pid {
+                    let _ = Command::new("kill").args(["-15", pid]).status();
+                    info!("Terminated process {}", pid);
+                }
+            }
+        }
+        _ => info!("No running background instances found."),
+    }
+
+    let _ = Command::new("killall")
+        .arg("afplay")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    info!("[STOP] Done.");
+}
+
 fn cmd_uninstall() {
     if unsafe { libc::geteuid() } != 0 {
         eprintln!("FATAL: You must run 'uninstall' with sudo.");
         process::exit(1);
     }
-    
+
     let plist_path = PathBuf::from("/Library/LaunchDaemons/com.user.dns-watchdog.plist");
     if plist_path.exists() {
         let _ = Command::new("launchctl")

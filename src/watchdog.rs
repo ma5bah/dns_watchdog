@@ -1,14 +1,14 @@
+use chrono::Local;
+use log::{debug, error, info, warn};
+use regex::Regex;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use chrono::Local;
-use log::{debug, info, warn};
-use regex::Regex;
 
-use crate::config::Config;
+use crate::config::{Config, Profile};
 use crate::notify::notify;
 use crate::rate_limit::RateLimiter;
 
@@ -31,42 +31,43 @@ impl DnsWatchdog {
     }
 
     pub fn run(&mut self) {
-        info!("DNS Watchdog starting — watchlist has {} entries, cooldown={}s", self.cfg.watchlist.len(), self.cfg.cooldown_seconds);
+        let total_rules: usize = self.cfg.profiles.iter().map(|p| p.watchlist.len()).sum();
+        info!(
+            "DNS Watchdog starting - {} profiles with {} rules total, cooldown={}s",
+            self.cfg.profiles.len(),
+            total_rules,
+            self.cfg.cooldown_seconds
+        );
 
         while !self.stop_flag.load(Ordering::SeqCst) {
-            self.stream_loop();
-            if !self.stop_flag.load(Ordering::SeqCst) {
-                warn!("tcpdump process ended unexpectedly. Restarting in 5s...");
+            if let Err(e) = self.stream_loop() {
+                if self.stop_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+                error!("Stream loop crashed: {} - restarting in 5s", e);
                 std::thread::sleep(Duration::from_secs(5));
             }
         }
-        
-        info!("DNS Watchdog shutting down cleanly.");
+
+        info!("DNS Watchdog stopped cleanly.");
     }
 
-    fn stream_loop(&mut self) {
-        let interface = "en0"; // Adjust this if necessary or make it configurable
-        
-        debug!("Launching tcpdump on interface {}", interface);
-        let mut child = match Command::new("tcpdump")
-            .args(["-l", "-n", "-i", interface, "udp", "port", "53"])
+    fn stream_loop(&mut self) -> Result<(), String> {
+        let cmd = build_log_stream_cmd();
+        debug!("Launching: {}", cmd.join(" "));
+
+        let mut child = Command::new(&cmd[0])
+            .args(&cmd[1..])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("Failed to start tcpdump: {}", e);
-                return;
-            }
-        };
+            .map_err(|e| format!("failed to start tcpdump: {e}"))?;
 
-        let stdout = child.stdout.take().expect("Failed to open stdout");
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "failed to open tcpdump stdout".to_string())?;
         let reader = BufReader::new(stdout);
-        
-        // Regex pattern: looks for A or AAAA records
-        // Ex: 192.168.1.1.53 > 192.168.1.2.1234: 1234 A? example.com.
-        let pattern = Regex::new(r"A\?\s+([a-zA-Z0-9.-]+)\.").unwrap();
 
         for line_res in reader.lines() {
             if self.stop_flag.load(Ordering::SeqCst) {
@@ -74,28 +75,42 @@ impl DnsWatchdog {
                 break;
             }
 
-            if let Ok(line) = line_res {
-                if let Some(caps) = pattern.captures(&line) {
-                    if let Some(domain_match) = caps.get(1) {
-                        let domain = domain_match.as_str().to_lowercase();
-                        self.process_domain(&domain);
-                    }
+            match line_res {
+                Ok(line) => self.process_line(line.trim_end()),
+                Err(e) => {
+                    let _ = child.kill();
+                    return Err(format!("failed reading tcpdump output: {e}"));
                 }
             }
         }
-        
-        let _ = child.wait();
+
+        let status = child
+            .wait()
+            .map_err(|e| format!("failed waiting for tcpdump: {e}"))?;
+        if !self.stop_flag.load(Ordering::SeqCst) && !status.success() {
+            return Err(format!("tcpdump exited with status {status}"));
+        }
+
+        Ok(())
     }
 
-    fn process_domain(&mut self, domain: &str) {
-        if let Some(hit) = match_watchlist(domain, &self.cfg.watchlist) {
-            let count = self.stats.entry(domain.to_string()).or_insert(0);
+    fn process_line(&mut self, line: &str) {
+        let Some(domain) = parse_domain(line) else {
+            return;
+        };
+
+        if let Some((hit, profile)) = match_profiles(&domain, &self.cfg.profiles) {
+            let count = self.stats.entry(domain.clone()).or_insert(0);
             *count += 1;
-            
-            info!("[HIT] {}  (matched: '{}', total_hits={})", domain, hit, count);
-            
+
+            info!("{}", line);
+            info!(
+                "[HIT] {}  (matched: '{}', profile: '{}', total_hits={})",
+                domain, hit, profile.name, count
+            );
+
             if self.limiter.should_alert(&hit) {
-                self.fire_alert(domain, &hit);
+                self.fire_alert(&domain, &hit, &profile);
             } else {
                 debug!("[RATE-LIMITED] {} (rule: '{}')", domain, hit);
             }
@@ -104,30 +119,133 @@ impl DnsWatchdog {
         }
     }
 
-    fn fire_alert(&mut self, domain: &str, matched_rule: &str) {
+    fn fire_alert(&self, domain: &str, matched_rule: &str, profile: &Profile) {
         let ts = Local::now().format("%H:%M:%S").to_string();
-        warn!("[ALERT] {}  rule='{}'  time={}", domain, matched_rule, ts);
-        
-        let title = "⚠️ DNS Watchdog Hit";
+        warn!(
+            "[ALERT] {}  rule='{}'  profile='{}'  time={}",
+            domain, matched_rule, profile.name, ts
+        );
+
+        let title = format!("⚠️ DNS Watchdog: {}", profile.name);
         let subtitle = format!("Rule: {}", matched_rule);
         let body = format!("{}  [{}]", domain, ts);
-        
-        notify(title, &subtitle, &body, Some(&self.cfg.alert_sound));
+
+        notify(
+            &title,
+            &subtitle,
+            &body,
+            &profile.alert_sound,
+            profile.alert_sound_duration,
+        );
     }
 }
 
-pub fn match_watchlist(domain: &str, watchlist: &[String]) -> Option<String> {
-    for rule in watchlist {
-        let r = rule.to_lowercase();
-        if r.ends_with('.') {
-            if domain.contains(&r) {
-                return Some(rule.clone());
+pub fn build_log_stream_cmd() -> Vec<String> {
+    vec![
+        "tcpdump".to_string(),
+        "-l".to_string(),
+        "-n".to_string(),
+        "port".to_string(),
+        "53".to_string(),
+    ]
+}
+
+pub fn parse_domain(line: &str) -> Option<String> {
+    for regex in dns_patterns() {
+        if let Some(caps) = regex.captures(line) {
+            let domain = caps
+                .get(1)
+                .map(|m| m.as_str().trim_end_matches('.').to_lowercase())?;
+            if domain == "local" || domain == "localhost" || domain.ends_with(".local") {
+                return None;
             }
-        } else {
-            if domain == r || domain.ends_with(&format!(".{}", r)) {
-                return Some(rule.clone());
+            return Some(domain);
+        }
+    }
+
+    None
+}
+
+fn dns_patterns() -> &'static [Regex] {
+    static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
+    PATTERNS.get_or_init(|| {
+        [
+            r"(?i)(?:Query|Resolve|resolv)\w*\s+for\s+([a-zA-Z0-9._\-]+\.[a-zA-Z]{2,})",
+            r"(?i)querying\s+([a-zA-Z0-9._\-]+\.[a-zA-Z]{2,})",
+            r"(?i)(?:^|\s)[A-Z0-9]+\?\s+([a-zA-Z0-9._\-]+\.[a-zA-Z]{2,})\.",
+            r#"[\s"']([a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z]{2,})+)["'\s]"#,
+        ]
+        .into_iter()
+        .map(|pattern| Regex::new(pattern).expect("DNS parser regex should compile"))
+        .collect()
+    })
+}
+
+pub fn match_profiles(domain: &str, profiles: &[Profile]) -> Option<(String, Profile)> {
+    let dl = domain.to_lowercase();
+    for profile in profiles {
+        for entry in &profile.watchlist {
+            let el = entry.to_lowercase();
+            if el.ends_with('.') {
+                if dl.contains(&el) {
+                    return Some((entry.clone(), profile.clone()));
+                }
+            } else if dl == el || dl.ends_with(&format!(".{}", el)) {
+                return Some((entry.clone(), profile.clone()));
             }
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_supported_dns_lines() {
+        assert_eq!(
+            parse_domain("mDNSResponder QueryRecord for Example.COM type A"),
+            Some("example.com".to_string())
+        );
+        assert_eq!(
+            parse_domain("dnscrypt-proxy querying tracker.example.org"),
+            Some("tracker.example.org".to_string())
+        );
+        assert_eq!(
+            parse_domain("10.0.0.1.53 > 10.0.0.2.55555: 1234 AAAA? sub.example.net."),
+            Some("sub.example.net".to_string())
+        );
+        assert_eq!(
+            parse_domain(r#"dns log "bare.example.io" token"#),
+            Some("bare.example.io".to_string())
+        );
+    }
+
+    #[test]
+    fn ignores_local_domains() {
+        assert_eq!(parse_domain("querying printer.local"), None);
+        assert_eq!(parse_domain("querying localhost"), None);
+    }
+
+    #[test]
+    fn matches_profiles_with_boundary_rules() {
+        let profiles = vec![Profile {
+            name: "Test".to_string(),
+            watchlist: vec!["example.com".to_string(), "tracking.".to_string()],
+            watchlist_file: String::new(),
+            alert_sound: String::new(),
+            alert_sound_duration: 0,
+        }];
+
+        assert_eq!(
+            match_profiles("a.example.com", &profiles).map(|(rule, profile)| (rule, profile.name)),
+            Some(("example.com".to_string(), "Test".to_string()))
+        );
+        assert!(match_profiles("badexample.com", &profiles).is_none());
+        assert_eq!(
+            match_profiles("cdn.tracking.vendor.net", &profiles).map(|(rule, _)| rule),
+            Some("tracking.".to_string())
+        );
+    }
 }
