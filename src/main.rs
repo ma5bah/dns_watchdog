@@ -48,6 +48,8 @@ enum Commands {
     Test,
     Stop,
     Install,
+    #[command(alias = "reload")]
+    Restart,
     Uninstall,
 }
 
@@ -155,6 +157,22 @@ fn main() {
         return;
     }
 
+    match cmd {
+        Commands::Install => {
+            cmd_install(&config_path);
+            return;
+        }
+        Commands::Restart => {
+            cmd_restart_daemon();
+            return;
+        }
+        Commands::Uninstall => {
+            cmd_uninstall();
+            return;
+        }
+        _ => {}
+    }
+
     setup_logging(&cfg.log_level, &log_path);
 
     match cmd {
@@ -179,6 +197,9 @@ fn main() {
         }
         Commands::Install => {
             cmd_install(&config_path);
+        }
+        Commands::Restart => {
+            cmd_restart_daemon();
         }
         Commands::Uninstall => {
             cmd_uninstall();
@@ -221,7 +242,7 @@ fn cmd_install(config_path: &Path) {
 
     let home_dir = get_true_home();
     let exec_path = env::current_exe().expect("Failed to get current executable path");
-    let plist_path = PathBuf::from("/Library/LaunchDaemons/com.user.dns-watchdog.plist");
+    let plist_path = daemon_plist_path();
 
     let plist_content = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -258,19 +279,7 @@ fn cmd_install(config_path: &Path) {
 
     fs::write(&plist_path, plist_content).expect("Failed to write plist file");
 
-    let _ = Command::new("launchctl")
-        .args(["unload", &plist_path.to_string_lossy()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-
-    let status = Command::new("launchctl")
-        .args(["load", "-w", &plist_path.to_string_lossy()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-
-    if status.is_ok() && status.unwrap().success() {
+    if restart_launchdaemon(&plist_path) {
         println!("✅ DNS Watchdog installed and started as a background daemon!");
     } else {
         eprintln!("Failed to load LaunchDaemon.");
@@ -302,13 +311,56 @@ fn cmd_stop() {
     info!("[STOP] Done.");
 }
 
+fn cmd_restart_daemon() {
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("FATAL: You must run 'restart' with sudo.");
+        process::exit(1);
+    }
+
+    let plist_path = daemon_plist_path();
+    if !plist_path.exists() {
+        eprintln!(
+            "LaunchDaemon is not installed at {}. Run 'sudo dns-watchdog install' first.",
+            plist_path.display()
+        );
+        process::exit(1);
+    }
+
+    if restart_launchdaemon(&plist_path) {
+        println!("✅ DNS Watchdog daemon restarted.");
+    } else {
+        eprintln!("Failed to restart LaunchDaemon.");
+        process::exit(1);
+    }
+}
+
+fn restart_launchdaemon(plist_path: &Path) -> bool {
+    let _ = Command::new("launchctl")
+        .args(["unload", &plist_path.to_string_lossy()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    Command::new("launchctl")
+        .args(["load", "-w", &plist_path.to_string_lossy()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn daemon_plist_path() -> PathBuf {
+    PathBuf::from("/Library/LaunchDaemons/com.user.dns-watchdog.plist")
+}
+
 fn cmd_uninstall() {
     if unsafe { libc::geteuid() } != 0 {
         eprintln!("FATAL: You must run 'uninstall' with sudo.");
         process::exit(1);
     }
 
-    let plist_path = PathBuf::from("/Library/LaunchDaemons/com.user.dns-watchdog.plist");
+    let plist_path = daemon_plist_path();
     if plist_path.exists() {
         let _ = Command::new("launchctl")
             .args(["unload", "-w", &plist_path.to_string_lossy()])

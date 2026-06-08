@@ -60,7 +60,9 @@ impl Default for Profile {
         Self {
             name: default_profile_name(),
             watchlist: vec!["not-random-facebook.com".to_string()],
-            watchlist_file: "~/project/clarity/Note/System_Configs/Blocklist/root_custom_blocklist.txt".to_string(),
+            watchlist_file:
+                "~/project/clarity/Note/System_Configs/Blocklist/root_custom_blocklist.txt"
+                    .to_string(),
             alert_sound: "~/project/clarity/Note/Religion/Audio/qayamat.wav".to_string(),
             alert_sound_duration: 0,
         }
@@ -120,6 +122,7 @@ pub fn load_config(config_path: &Path) -> Config {
         }
     }
 
+    normalize_profile_paths(&mut cfg, config_path);
     load_profile_watchlists(&mut cfg);
     cfg
 }
@@ -172,6 +175,39 @@ fn load_profile_watchlists(cfg: &mut Config) {
 
         dedup_preserve_order(&mut profile.watchlist);
     }
+}
+
+fn normalize_profile_paths(cfg: &mut Config, config_path: &Path) {
+    for profile in &mut cfg.profiles {
+        if !profile.watchlist_file.is_empty() {
+            profile.watchlist_file =
+                expand_user_path_for_config(&profile.watchlist_file, config_path)
+                    .to_string_lossy()
+                    .to_string();
+        }
+        if !profile.alert_sound.is_empty() {
+            profile.alert_sound = expand_user_path_for_config(&profile.alert_sound, config_path)
+                .to_string_lossy()
+                .to_string();
+        }
+    }
+}
+
+fn expand_user_path_for_config(p: &str, config_path: &Path) -> PathBuf {
+    if p.starts_with("~/") {
+        if let Some(home) = home_from_config_path(config_path) {
+            return home.join(&p[2..]);
+        }
+    }
+    expand_user_path(p)
+}
+
+fn home_from_config_path(config_path: &Path) -> Option<PathBuf> {
+    let config_dir = config_path.parent()?;
+    if config_dir.file_name()? == ".dns_watchdog" {
+        return config_dir.parent().map(Path::to_path_buf);
+    }
+    None
 }
 
 pub fn apply_watchlist_override(cfg: &mut Config, watchlist_file: &str) {

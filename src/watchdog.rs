@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use crate::config::{Config, Profile};
+use crate::config::{Config, Profile, expand_user_path};
 use crate::notify::notify;
 use crate::rate_limit::RateLimiter;
 
@@ -38,6 +38,9 @@ impl DnsWatchdog {
             total_rules,
             self.cfg.cooldown_seconds
         );
+        for profile in &self.cfg.profiles {
+            log_profile_assets(profile);
+        }
 
         while !self.stop_flag.load(Ordering::SeqCst) {
             if let Err(e) = self.stream_loop() {
@@ -137,6 +140,42 @@ impl DnsWatchdog {
             &profile.alert_sound,
             profile.alert_sound_duration,
         );
+    }
+}
+
+fn log_profile_assets(profile: &Profile) {
+    if profile.watchlist_file.is_empty() {
+        info!(
+            "Profile '{}' has {} inline rules and no watchlist_file",
+            profile.name,
+            profile.watchlist.len()
+        );
+    } else {
+        let path = expand_user_path(&profile.watchlist_file);
+        let status = if path.is_file() { "found" } else { "missing" };
+        info!(
+            "Profile '{}' has {} rules; watchlist_file={} ({})",
+            profile.name,
+            profile.watchlist.len(),
+            path.display(),
+            status
+        );
+    }
+
+    if !profile.alert_sound.is_empty() {
+        let path = expand_user_path(&profile.alert_sound);
+        if path.is_file() {
+            info!(
+                "Profile '{}' alert_sound file={}",
+                profile.name,
+                path.display()
+            );
+        } else {
+            info!(
+                "Profile '{}' alert_sound treated as macOS sound name='{}'",
+                profile.name, profile.alert_sound
+            );
+        }
     }
 }
 
