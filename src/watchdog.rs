@@ -140,6 +140,21 @@ impl DnsWatchdog {
             &profile.alert_sound,
             profile.alert_sound_duration,
         );
+
+        if !profile.redirect_url.is_empty() {
+            let active_user = crate::notify::get_active_user();
+            info!(
+                "[REDIRECT] Opening {} for user {}",
+                profile.redirect_url, active_user
+            );
+            let mut cmd = Command::new("sudo");
+            cmd.args(["-u", &active_user, "open", &profile.redirect_url])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if let Err(e) = cmd.spawn() {
+                error!("Failed to open redirect_url: {}", e);
+            }
+        }
     }
 }
 

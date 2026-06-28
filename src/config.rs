@@ -17,6 +17,8 @@ pub struct Profile {
     pub alert_sound: String,
     #[serde(default)]
     pub alert_sound_duration: u64,
+    #[serde(default = "default_redirect_url")]
+    pub redirect_url: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -41,6 +43,7 @@ struct RawConfig {
     watchlist_file: Option<String>,
     alert_sound: Option<String>,
     alert_sound_duration: Option<u64>,
+    redirect_url: Option<String>,
 }
 
 fn default_profile_name() -> String {
@@ -55,6 +58,10 @@ fn default_log_level() -> String {
     "INFO".to_string()
 }
 
+fn default_redirect_url() -> String {
+    "https://masbahuddin.com/obsession".to_string()
+}
+
 impl Default for Profile {
     fn default() -> Self {
         Self {
@@ -65,6 +72,7 @@ impl Default for Profile {
                     .to_string(),
             alert_sound: "~/project/clarity/Note/Religion/Audio/qayamat.wav".to_string(),
             alert_sound_duration: 0,
+            redirect_url: default_redirect_url(),
         }
     }
 }
@@ -135,6 +143,7 @@ fn merge_raw_config(cfg: &mut Config, raw: RawConfig) {
             watchlist_file: raw.watchlist_file.unwrap_or_default(),
             alert_sound: raw.alert_sound.unwrap_or_default(),
             alert_sound_duration: raw.alert_sound_duration.unwrap_or_default(),
+            redirect_url: raw.redirect_url.unwrap_or_default(),
         }];
     } else if let Some(profiles) = raw.profiles {
         cfg.profiles = profiles;
@@ -218,6 +227,7 @@ pub fn apply_watchlist_override(cfg: &mut Config, watchlist_file: &str) {
             watchlist_file: watchlist_file.to_string(),
             alert_sound: String::new(),
             alert_sound_duration: 0,
+            redirect_url: default_redirect_url(),
         });
     } else {
         cfg.profiles[0].watchlist_file = watchlist_file.to_string();
